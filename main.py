@@ -1,9 +1,18 @@
+import copy
 import os
-from PIL import Image
+import sys
 
-# Show map
-img = Image.open('Map.png')
-img.show()
+# Show map (optional; the game runs headless too)
+def show_map():
+    if not sys.stdin.isatty():
+        print("Map: Map.png")
+        return
+    try:
+        from PIL import Image
+        Image.open('Map.png').show()
+    except Exception:
+        print("Map: Map.png")
+
 
 # Display starting menu
 def prompt():
@@ -15,128 +24,171 @@ Moves:\t'go {direction}' (travel north, south, east, or west)\n\
     input("Press any key to continue...")
 
 
-# Clear screen
+# Clear screen (only in a real terminal)
 def clear():
-    os.system('cls' if os.name == 'nt' else 'clear')
+    if sys.stdout.isatty():
+        os.system('cls' if os.name == 'nt' else 'clear')
 
 
-# Map
-rooms = {
+# Map: this table mirrors Map.png exactly and is treated as read-only data.
+ROOMS = {
     'Liminal Space': {'North': 'Mirror Maze', 'South': 'Bat Cavern', 'East': 'Bazaar'},
     'Mirror Maze': {'South': 'Liminal Space', 'Item': 'Crystal'},
     'Bat Cavern': {'North': 'Liminal Space', 'East': 'Volcano', 'Item': 'Staff'},
-    'Bazaar' : {'West': 'Liminal Space', 'North': 'Meat Locker', 'East': 'Dojo', 'Item': 'Altoids'},
-    'Meat Locker' : {'South': 'Bazaar', 'East': 'Quicksand Pit', 'Item': 'Fig'},
+    'Bazaar': {'West': 'Liminal Space', 'North': 'Meat Locker', 'East': 'Dojo', 'Item': 'Altoids'},
+    'Meat Locker': {'South': 'Bazaar', 'East': 'Quicksand Pit', 'Item': 'Fig Newton'},
     'Quicksand Pit': {'West': 'Meat Locker', 'Item': 'Robe'},
-    'Volcano': {'West': 'Bat Cavern', 'Item': 'Elderberry'},
-    'Dojo': {'West': 'Bazaar', 'Boss': 'Shadow Man'}
-    }
+    'Volcano': {'West': 'Bat Cavern', 'Item': 'Elderberry Syrup'},
+    'Dojo': {'West': 'Bazaar', 'Boss': 'Shadow Self'},
+}
 
-# List of vowels
-vowels = ['a', 'e', 'i', 'o', 'u']
+DIRECTIONS = ('North', 'South', 'East', 'West')
+VOWELS = ('a', 'e', 'i', 'o', 'u')
+START_ROOM = 'Liminal Space'
+START_HEALTH = 3
 
-# List to track inventory
-inventory = []
 
-# Tracks current room
-current_room = "Liminal Space"
+def fresh_world():
+    """A deep copy of the map so the shared ROOMS table is never mutated."""
+    return copy.deepcopy(ROOMS)
 
-# Tracks last move
-msg = ""
 
-clear()
-prompt()
+class GameState:
+    """Immutable-ish state; apply_command builds a new instance or returns
+    the original unchanged when a command fails (full rollback)."""
 
-# Gameplay loop
-while True:
+    def __init__(self, current_room=START_ROOM, inventory=(), health=START_HEALTH,
+                 status='playing', world=None):
+        self.current_room = current_room
+        self.inventory = tuple(sorted(inventory))
+        self.health = health
+        self.status = status
+        self.world = world if world is not None else fresh_world()
 
-    clear()
+    def snapshot(self):
+        return copy.deepcopy({
+            'current_room': self.current_room,
+            'inventory': self.inventory,
+            'health': self.health,
+            'status': self.status,
+            'world': self.world,
+        })
 
-    # Display player info
-    print(f"You are in the {current_room}\nInventory : {inventory}\n{'-' * 27}")
 
-    # Display msg
+def new_game():
+    return GameState()
+
+
+def parse_command(user_input):
+    words = user_input.strip().split()
+    if not words:
+        return '', ()
+    return words[0].title(), tuple(word.title() for word in words[1:])
+
+
+def apply_command(state, user_input):
+    """Apply one command transactionally.
+
+    Returns (next_state, message). On failure the exact same state object is
+    returned and nothing is mutated, so a failed move can never pollute the
+    next move.
+    """
+    if state.status != 'playing':
+        return state, "The game is over. Type 'exit' to quit."
+
+    action, targets = parse_command(user_input)
+
+    if action == 'Exit':
+        return GameState(state.current_room, state.inventory, state.health,
+                         'quit', copy.deepcopy(state.world)), "Goodbye!"
+
+    if action == 'Go':
+        if len(targets) != 1 or targets[0] not in DIRECTIONS:
+            return state, "You can't go that way."
+        direction = targets[0]
+        room = state.world[state.current_room]
+        if direction not in room:
+            return state, "You can't go that way."
+        next_state = GameState(state.current_room, state.inventory, state.health,
+                               state.status, copy.deepcopy(state.world))
+        next_room = room[direction]
+        next_state.current_room = next_room
+
+        if 'Boss' in next_state.world[next_room]:
+            if len(next_state.inventory) < 6:
+                next_state.health = 0
+                next_state.status = 'lost'
+                return next_state, f"You lost a fight with {next_state.world[next_room]['Boss']}."
+            next_state.status = 'won'
+            return next_state, f"You beat {next_state.world[next_room]['Boss']}!"
+
+        return next_state, f"You travel {direction}"
+
+    if action == 'Get':
+        if not targets:
+            return state, "Can't find that"
+        item = " ".join(targets)
+        room_item = state.world[state.current_room].get('Item')
+        if room_item is None or item != room_item:
+            return state, f"Can't find {item}"
+        if item in state.inventory:
+            return state, f"You already have the {item}"
+        next_world = copy.deepcopy(state.world)
+        del next_world[state.current_room]['Item']
+        next_state = GameState(state.current_room,
+                               state.inventory + (item,),
+                               state.health, state.status, next_world)
+        return next_state, f"{item} retrieved!"
+
+    if action == '':
+        return state, "Invalid command"
+
+    return state, "Invalid command"
+
+
+def describe_item(item):
+    if item.endswith('s'):
+        return f"You see {item}"
+    article = 'an' if item[0].lower() in VOWELS else 'a'
+    return f"You see {article} {item}"
+
+
+def render(state, msg):
+    print(f"You are in the {state.current_room}")
+    print(f"Inventory : {list(state.inventory)}")
+    print(f"Health    : {state.health}")
+    print('-' * 27)
     print(msg)
+    room = state.world[state.current_room]
+    if 'Item' in room:
+        print(describe_item(room['Item']))
 
-    # Item indicator
-    if "Item" in rooms[current_room].keys():
 
-        nearby_item = rooms[current_room]["Item"]
+def main():
+    show_map()
+    clear()
+    prompt()
 
-        if nearby_item not in inventory:
+    state = new_game()
+    msg = ""
 
-            if nearby_item[-1] == 's':
-                print(f"You see {nearby_item}")
+    while True:
+        clear()
+        render(state, msg)
 
-            elif nearby_item[0] in vowels:
-                print(f"You see an {nearby_item}")
-
-            else:
-                print(f"You see a {nearby_item}")
-    
-    # Boss encounter
-    if "Boss" in rooms[current_room].keys():
-
-        if len(inventory) < 6:
-            print(f"You lost a fight with {rooms[current_room]['Boss']}.")
+        if state.status == 'won' or state.status == 'lost':
             break
 
-        else:
-            print(f"You beat {rooms[current_room]['Boss']}!")
+        try:
+            user_input = input("Enter your move:\n")
+        except EOFError:
             break
 
-    # Accepts player's move as input
-    user_input = input("Enter your move:\n")
+        state, msg = apply_command(state, user_input)
+        if state.status == 'quit':
+            print(msg)
+            break
 
-    # Splits move into words
-    next_move = user_input.split(' ')
 
-    # First word is action
-    action = next_move[0].title()
-
-    # Reset item and direction
-    item = "Item"
-    direction = "null"
-
-    # Second word is object or direction
-    if len(next_move) > 1:
-        item = next_move[1:]
-        direction = next_move[1].title()
-
-        item = " ".join(item).title()
-
-    # Moving between rooms
-    if action == "Go":
-
-        try:
-            current_room = rooms[current_room][direction]
-            msg = f"You travel {direction}"
-
-        except:
-            msg = "You can't go that way."
-    
-    # Picking up items
-    elif action == "Get":
-        try:
-            if item == rooms[current_room]["Item"]:
-
-                if item not in inventory:
-
-                    inventory.append(rooms[current_room]["Item"])
-                    msg = f"{item} retrieved!"
-
-                else:
-                    msg = f"You already have the {item}"
-            
-            else:
-                msg = f"Can't find {item}"
-        except:
-            msg = f"Can't find {item}"
-    
-    # Exit program
-    elif action == "Exit":
-        break
-
-    # Any other commands invalid
-    else:
-        msg = "Invalid command"
+if __name__ == '__main__':
+    main()
